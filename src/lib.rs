@@ -3,10 +3,12 @@ extern crate brotli;
 extern crate core;
 extern crate lepton_mux as mux;
 
+mod byte_converter;
 mod compressor;
 mod decompressor;
 mod interface;
 mod iostream;
+mod jpeg_decoder;
 mod primary_header;
 mod resizable_buffer;
 mod secondary_header;
