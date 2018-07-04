@@ -1,46 +1,13 @@
 use std::cmp::min;
 use std::collections::VecDeque;
-use std::error::Error;
-use std::fmt;
-use std::iter::ExactSizeIterator;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use byte_converter::ByteConverter;
 
-// #[derive(Debug)]
-// pub enum StreamError {
-//     ReadAfterEof,
-//     StreamAborted,
-//     UnexpectedEof,
-//     WriteAfterEof,
-// }
-
-// impl fmt::Display for StreamError {
-//     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-//         use self::StreamError::*;
-//         match *self {
-//             ReadAfterEof => write!(formatter, "Read after EOF."),
-//             StreamAborted => write!(formatter, "Stream aborted by reader."),
-//             UnexpectedEof => write!(formatter, "Unexpected EOF."),
-//             WriteAfterEof => write!(formatter, "Write after EOF."),
-//         }
-//     }
-// }
-
-// impl Error for StreamError {
-//     fn description(&self) -> &str {
-//         use self::StreamError::*;
-//         match *self {
-//             ReadAfterEof => "Read after EOF.",
-//             StreamAborted => "Stream aborted by reader.",
-//             UnexpectedEof => "Unexpected EOF.",
-//             WriteAfterEof => "Write after EOF.",
-//         }
-//     }
-// }
-
 pub type InputResult<T> = Result<T, InputError>;
 pub type OutputResult<T> = Result<T, OutputError>;
+
+const CONVERTER_BUF_LEN: usize = 8;
 
 #[derive(Debug)]
 pub enum InputError {
@@ -59,98 +26,90 @@ pub fn iostream() -> (InputStream, OutputStream) {
     let iostream = Arc::new(IoStream::default());
     (
         InputStream::new(iostream.clone()),
-        OutputStream {
-            ostream: iostream,
-        },
+        OutputStream { ostream: iostream },
     )
 }
 
 pub struct InputStream {
     istream: Arc<IoStream>,
-    converter_buf: [u8; 8],
-    buffer: Vec<u8>
+    buffer: Vec<u8>,
+    processed_len: usize,
 }
 
 impl InputStream {
     pub fn new(istream: Arc<IoStream>) -> Self {
         InputStream {
             istream,
-            converter_buf: [0; 8], // TODO: use a vector to adapt to different needs?
-            buffer: vec![]
+            buffer: vec![],
+            processed_len: 0,
         }
     }
 
-    // #[inline(always)]
-    // pub fn read_byte(&self) -> InputResult<u8> {
-    //     self.istream.read_byte()
-    // }
-
     #[inline(always)]
-    pub fn read_byte_keep(&self) -> InputResult<u8> {
-        let result = self.istream.read_byte();
-        if let Ok(byte) = result {
+    pub fn read_byte(&mut self, keep: bool) -> InputResult<u8> {
+        let byte = self.istream.read_byte()?;
+        self.processed_len += 1;
+        if keep {
             self.buffer.push(byte);
         }
-        result
-    }
-
-    // #[inline(always)]
-    // pub fn read_u16<Converter: ByteConverter>(&self) -> InputResult<u16> {
-    //     self.read_as_type(2, &Converter::slice_to_u16, false)
-    // }
-
-    #[inline(always)]
-    pub fn read_u16_keep<Converter: ByteConverter>(&self) -> InputResult<u16> {
-        self.read_as_type(2, &Converter::slice_to_u16, true)
-    }
-
-    // #[inline(always)]
-    // pub fn read_u32<Converter: ByteConverter>(&self) -> InputResult<u32> {
-    //     self.read_as_type(4, &Converter::slice_to_u32, false)
-    // }
-
-    #[inline(always)]
-    pub fn read_u32_keep<Converter: ByteConverter>(&self) -> InputResult<u32> {
-        self.read_as_type(4, &Converter::slice_to_u32, true)
+        Ok(byte)
     }
 
     #[inline(always)]
-    pub fn read(&self, buf: &mut [u8], fill: bool) -> InputResult<usize> {
-        self.istream.read(buf, fill)
+    pub fn read_u16<Converter: ByteConverter>(&mut self, keep: bool) -> InputResult<u16> {
+        self.read_as_type(2, &Converter::slice_to_u16, keep)
     }
 
     #[inline(always)]
-    pub fn read_keep(&self, buf: &mut [u8], fill: bool) -> InputResult<usize> {
-        let result = self.istream.read(buf, fill);
-        if let Ok(len) = result {
+    pub fn read_u32<Converter: ByteConverter>(&mut self, keep: bool) -> InputResult<u32> {
+        self.read_as_type(4, &Converter::slice_to_u32, keep)
+    }
+
+    #[inline(always)]
+    pub fn read(&mut self, buf: &mut [u8], fill: bool, keep: bool) -> InputResult<usize> {
+        let len = self.istream.read(buf, fill)?;
+        self.processed_len += len;
+        if keep {
             self.buffer.extend(&buf[..len]);
         }
-        result
+        Ok(len)
     }
 
     #[inline(always)]
-    pub fn consume(&self, len: usize) -> InputResult<usize> {
-        self.istream.consume(len)
-    }
-
-    #[inline(always)]
-    pub fn consume_keep(&self, len: usize) -> InputResult<usize> {
-        let buffer_len = self.buffer.len();
-        self.buffer.resize(buffer_len + len, 0);
-        let result = self.istream.read(&mut self.buffer[buffer_len..], true);
-        if let Err(_) = result {
-            self.buffer.truncate(buffer_len);
+    pub fn consume(&mut self, len: usize, keep: bool) -> InputResult<usize> {
+        if keep {
+            let buffer_len = self.buffer.len();
+            self.buffer.resize(buffer_len + len, 0);
+            let result = self.istream.read(&mut self.buffer[buffer_len..], true);
+            match result {
+                Ok(len) => self.processed_len += len,
+                Err(_) => self.buffer.truncate(buffer_len),
+            }
+            result
+        } else {
+            let len = self.istream.consume(len)?;
+            self.processed_len += len;
+            Ok(len)
         }
-        result
     }
 
     #[inline(always)]
-    pub fn retained_data(&self) -> &[u8] {
+    pub fn processed_len(&self) -> usize {
+        self.processed_len
+    }
+
+    #[inline(always)]
+    pub fn reset_processed_len(&mut self) {
+        self.processed_len = 0;
+    }
+
+    #[inline(always)]
+    pub fn read_retained_data(&self) -> &[u8] {
         self.buffer.as_slice()
     }
 
     #[inline(always)]
-    pub fn clear_retained(&self) {
+    pub fn clear_retained_data(&mut self) {
         self.buffer.clear();
     }
 
@@ -195,16 +154,16 @@ impl InputStream {
     }
 
     #[inline(always)]
-    fn read_as_type<T>(&self, len: usize, converter: &Fn(&[u8]) -> T, keep: bool) -> InputResult<T> {
-        assert!(len <= self.converter_buf.len());
-        let read_fn: &Fn(&InputStream, &mut [u8], bool) -> InputResult<usize> = match keep {
-            true => &Self::read_keep,
-            false => &Self::read,
-        };
-        match read_fn(&self, &mut self.converter_buf[..len], true) {
-            Ok(_) => Ok(converter(&self.converter_buf)),
-            Err(e) => Err(e),
-        }
+    fn read_as_type<T>(
+        &mut self,
+        len: usize,
+        converter: &Fn(&[u8]) -> T,
+        keep: bool,
+    ) -> InputResult<T> {
+        assert!(len <= CONVERTER_BUF_LEN);
+        let mut buf = [0u8; CONVERTER_BUF_LEN];
+        self.read(&mut buf[..len], true, keep)?;
+        Ok(converter(&buf[..len]))
     }
 }
 
@@ -288,12 +247,12 @@ impl IoStream {
     }
 
     pub fn is_aborted(&self) -> bool {
-        let mut stream_buf = self.data.lock().unwrap();
+        let stream_buf = self.data.lock().unwrap();
         stream_buf.aborted
     }
 
     pub fn is_closed(&self) -> bool {
-        let mut stream_buf = self.data.lock().unwrap();
+        let stream_buf = self.data.lock().unwrap();
         stream_buf.reader_closed
     }
 }
@@ -355,13 +314,13 @@ impl IoStream {
     }
 
     fn lock_for_read(&self) -> InputResult<MutexGuard<StreamBuffer>> {
-        let mut stream_buf = self.data.lock().unwrap();
+        let stream_buf = self.data.lock().unwrap();
         stream_buf.validate_for_read(false)?;
         Ok(stream_buf)
     }
 
     fn wait_for_read<'a>(
-        stream_buf: MutexGuard<'a, StreamBuffer>,
+        mut stream_buf: MutexGuard<'a, StreamBuffer>,
         len: usize,
         cv: &Condvar,
     ) -> InputResult<MutexGuard<'a, StreamBuffer>> {
@@ -397,7 +356,7 @@ impl IoStream {
     }
 
     pub fn unread_data(&self) -> Option<Vec<u8>> {
-        let stream_buf = self.data.lock().unwrap();
+        let mut stream_buf = self.data.lock().unwrap();
         if stream_buf.reader_closed && !stream_buf.data.is_empty() {
             Some(stream_buf.data.drain(..).collect())
         } else {
@@ -406,7 +365,7 @@ impl IoStream {
     }
 
     fn lock_for_write(&self) -> OutputResult<MutexGuard<StreamBuffer>> {
-        let mut stream_buf = self.data.lock().unwrap();
+        let stream_buf = self.data.lock().unwrap();
         stream_buf.validate_for_write()?;
         Ok(stream_buf)
     }
@@ -462,17 +421,5 @@ impl StreamBuffer {
 
     fn is_eof(&self) -> bool {
         self.data.is_empty() && self.eof_written
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::iostream;
-
-    #[test]
-    fn test_alloc_dealloc() {
-        let (istream, ostream) = iostream();
-        ostream.write_eof();
-        istream.abort();
     }
 }

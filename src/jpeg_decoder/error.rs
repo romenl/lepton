@@ -37,18 +37,20 @@ pub enum UnsupportedFeature {
 pub enum JpegError {
     /// The image is not formatted properly. The string contains detailed information about the
     /// error.
-    Malformatted(&'static str),
+    Malformatted(String),
     /// The image makes use of a JPEG feature not (currently) supported by this library.
     Unsupported(UnsupportedFeature),
     /// An I/O error occurred while decoding the image.
     Io(IoError),
+    /// EOF is encountered when trying to read data. This may or may not be an error.
+    EOF,
     // /// An internal error occurred while decoding the image.
     // Internal(Box<StdError>),
 }
 
 impl From<InputError> for JpegError {
-    fn from(err: InputError) -> JpegError {
-        JpegError::Malformatted("unexpected EOF")
+    fn from(_err: InputError) -> JpegError {
+        JpegError::EOF
     }
 }
 
