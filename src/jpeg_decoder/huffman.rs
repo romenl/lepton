@@ -1,40 +1,51 @@
-use super::error::{JpegError, JpegResult};
-use super::marker::Marker;
-use super::parser::ScanInfo;
-use iostream::InputStream;
+use std::cmp::min;
 use std::iter::repeat;
+
+use super::error::{HuffmanError, JpegError, JpegResult};
+use super::jpeg::ScanInfo;
+use super::marker::Marker;
+use iostream::{InputResult, InputStream};
+
+pub type HuffmanResult<T> = Result<T, HuffmanError>;
 
 const LUT_BITS: u8 = 8; // LUT = Lookup Table
 
 #[derive(Debug)]
 pub struct HuffmanDecoder {
     bits: u64,
-    num_bits: u8,
-    marker: Option<Marker>,
-    // buffer: Vec<u8>,
-    // overhang: Option<(u8, u8)>,
-    // start_byte: usize,
+    bit_start: u8,
+    n_bit: u8,
+    buffer: Vec<u8>,
+    is_eof: bool,
+    n_fill_byte: u8,
+    start_byte: usize,
+    pge: Vec<u8>,
 }
 
 impl HuffmanDecoder {
-    pub fn new() -> HuffmanDecoder {
+    pub fn new(start_byte: usize) -> HuffmanDecoder {
         HuffmanDecoder {
             bits: 0,
-            num_bits: 0,
-            marker: None,
+            bit_start: 0,
+            n_bit: 0,
+            buffer: vec![],
+            is_eof: false,
+            n_fill_byte: 0,
+            start_byte,
+            pge: vec![],
         }
     }
 
     // Section F.2.2.3
     // Figure F.16
-    pub fn decode(&mut self, input: &mut InputStream, table: &HuffmanTable) -> JpegResult<u8> {
-        let (value, size) = table.lut[self.peek_bits(input, LUT_BITS)? as usize];
+    pub fn decode(&mut self, input: &mut InputStream, table: &HuffmanTable) -> HuffmanResult<u8> {
+        let (value, size) = table.lut[self.peek_bits(input, LUT_BITS, true)? as usize];
         if size > 0 {
             self.consume_bits(size);
             Ok(value)
         } else {
-            let bits = self.peek_bits(input, 16)?;
-            for i in LUT_BITS..16 {
+            let bits = self.peek_bits(input, 16, true)?;
+            for i in LUT_BITS..min(16, self.n_bit) {
                 let code = (bits >> (15 - i)) as i32;
                 if code <= table.maxcode[i as usize] {
                     self.consume_bits(i + 1);
@@ -42,9 +53,11 @@ impl HuffmanDecoder {
                     return Ok(table.values[index]);
                 }
             }
-            Err(JpegError::Malformatted(
-                "failed to decode huffman code".to_owned(),
-            ))
+            if self.n_bit < 16 {
+                Err(HuffmanError::EOF)
+            } else {
+                Err(HuffmanError::BadCode)
+            }
         }
     }
 
@@ -52,9 +65,9 @@ impl HuffmanDecoder {
         &mut self,
         input: &mut InputStream,
         table: &HuffmanTable,
-    ) -> JpegResult<Option<(i16, u8)>> {
+    ) -> HuffmanResult<Option<(i16, u8)>> {
         if let Some(ref ac_lut) = table.ac_lut {
-            let (value, run_size) = ac_lut[self.peek_bits(input, LUT_BITS)? as usize];
+            let (value, run_size) = ac_lut[self.peek_bits(input, LUT_BITS, true)? as usize];
             if run_size != 0 {
                 let run = run_size >> 4;
                 let size = run_size & 0x0f;
@@ -66,102 +79,141 @@ impl HuffmanDecoder {
     }
 
     #[inline]
-    pub fn get_bits(&mut self, input: &mut InputStream, count: u8) -> JpegResult<u16> {
-        let bits = self.peek_bits(input, count/*, false*/)?;
+    pub fn get_bits(&mut self, input: &mut InputStream, count: u8) -> HuffmanResult<u16> {
+        let bits = self.peek_bits(input, count, false)?;
         self.consume_bits(count);
         Ok(bits)
     }
 
     #[inline]
-    pub fn receive_extend(&mut self, input: &mut InputStream, count: u8) -> JpegResult<i16> {
+    pub fn receive_extend(&mut self, input: &mut InputStream, count: u8) -> HuffmanResult<i16> {
         let value = self.get_bits(input, count)?;
         Ok(extend(value, count))
     }
 
+    pub fn read_rst(
+        &mut self,
+        input: &mut InputStream,
+        expected_rst_num: u8,
+    ) -> JpegResult<Marker> {
+        if self.read_byte(input)? != 0xFF {
+            return Err(JpegError::Malformatted(
+                "no marker found where expected".to_owned(),
+            ));
+        }
+        let mut byte = self.read_byte(input)?;
+        // Section B.1.1.2
+        // "Any marker may optionally be preceded by any number of fill bytes, which are bytes assigned code X’FF’."
+        while byte == 0xFF {
+            byte = self.read_byte(input)?;
+        }
+        match byte {
+            0x00 => Err(JpegError::Malformatted(
+                "0xFF00 found where RST marker was expected".to_owned(),
+            )),
+            _ => match Marker::from_u8(byte).unwrap() {
+                Marker::RST(n) => {
+                    if n != expected_rst_num {
+                        Err(JpegError::Malformatted(format!(
+                            "found RST{} where RST{} was expected",
+                            n, expected_rst_num
+                        )))
+                    } else {
+                        Ok(Marker::RST(n))
+                    }
+                }
+                other => Err(JpegError::Malformatted(format!(
+                    "found marker {:?} inside scan where RST{} was expected",
+                    other, expected_rst_num
+                ))),
+            },
+        }
+    }
+
     pub fn reset(&mut self) {
         self.bits = 0;
-        self.num_bits = 0;
+        self.bit_start = 0;
+        self.n_bit = 0;
     }
 
-    pub fn take_marker(&mut self, input: &mut InputStream) -> JpegResult<Option<Marker>> {
-        // TODO: Read to header directly
-        self.read_bits(input).map(|_| self.marker.take())
+    pub fn clear_buffer(&mut self) {
+        self.buffer.clear()
     }
 
-    // pub fn clear_buffer(&mut self) {
-    //     self.buffer.clear()
-    // }
+    pub fn view_buffer(&mut self) -> &[u8] {
+        &self.buffer
+    }
 
-    // pub fn overhang_byte(&mut self, input: &mut InputStream) -> JpegResult<(u8, u8)> {
-        
-    // }
+    pub fn handover_byte(&self) -> (u8, u8) {
+        ((self.bits >> 56) as u8, self.bit_start)
+    }
+
+    pub fn end_pge(&mut self) {
+        self.start_byte = 0;
+    }
+
+    pub fn get_pge(&self) -> &[u8] {
+        &self.pge
+    }
 
     #[inline]
-    fn peek_bits(&mut self, input: &mut InputStream, count: u8/*, fill_after_eof: bool*/) -> JpegResult<u16> {
+    fn peek_bits(
+        &mut self,
+        input: &mut InputStream,
+        count: u8,
+        zero_fill: bool,
+    ) -> HuffmanResult<u16> {
         debug_assert!(count <= 16);
-        if self.num_bits < count {
-            self.read_bits(input/*, count, fill_after_eof*/)?;
+        if self.n_bit < count {
+            if let Err(e) = self.read_bits(input, count) {
+                if !zero_fill || self.n_bit == 0 {
+                    return Err(e);
+                }
+            }
         }
-        Ok(((self.bits >> (64 - count)) & ((1 << count) - 1)) as u16)
+        Ok(((self.bits >> (64 - self.bit_start - count)) & ((1 << count) - 1)) as u16)
     }
 
     #[inline]
     fn consume_bits(&mut self, count: u8) {
-        debug_assert!(self.num_bits >= count);
-        self.bits <<= count as usize;
-        self.num_bits -= count;
+        debug_assert!(count <= self.n_bit);
+        self.bit_start += count;
+        while self.bit_start >= 8 {
+            self.bit_start -= 8;
+            self.bits <<= 8;
+        }
+        self.n_bit -= count;
     }
 
-    fn read_bits(&mut self, input: &mut InputStream/*, count: usize, fill_after_eof: bool*/) -> JpegResult<()> {
-        // debug_assert!(count <= 56);
-        while self.num_bits <= 56 {
-            // Fill with zero bits if we have reached the end.
-            let byte = match self.marker {
-                Some(_) => 0,
-                None => self.read_byte(input)?,
-            };
+    fn read_bits(&mut self, input: &mut InputStream, count: u8) -> HuffmanResult<()> {
+        debug_assert!(count <= 57); // FIXME: count <= 49?
+        while self.n_bit < count {
+            let byte = input.peek_byte()?;
             if byte == 0xFF {
-                let mut next_byte = self.read_byte(input)?;
-                // Check for byte stuffing.
-                if next_byte != 0x00 {
-                    // We seem to have reached the end of entropy-coded data and encountered a
-                    // marker. Since we can't put data back into the reader, we have to continue
-                    // reading to identify the marker so we can pass it on.
-
-                    // Section B.1.1.2
-                    // "Any marker may optionally be preceded by any number of fill bytes, which are bytes assigned code X’FF’."
-                    while next_byte == 0xFF {
-                        next_byte = self.read_byte(input)?;
-                    }
-                    match next_byte {
-                        0x00 => {
-                            return Err(JpegError::Malformatted(
-                                "0xFF00 found where marker was expected (read_bits)".to_owned(),
-                            ))
-                        }
-                        _ => self.marker = Some(Marker::from_u8(next_byte).unwrap()),
-                        // TODO: If marker is not SOS then data in buffer and rest of the stream is GRB
-                    }
-                    continue;
+                let mut buf = [0u8; 2];
+                input.peek(&mut buf, true)?;
+                if buf[1] != 0x00 {
+                    return Err(HuffmanError::UnexpectedMarker(buf[1]));
                 }
+                self.read_byte(input)?;
             }
-            self.bits |= (byte as u64) << (56 - self.num_bits);
-            self.num_bits += 8;
+            self.read_byte(input)?;
+            self.bits |= (byte as u64) << (56 - self.bit_start - self.n_bit);
+            self.n_bit += 8;
         }
         Ok(())
     }
 
-    fn read_byte(&mut self, input: &mut InputStream) -> JpegResult<u8> {
-        // TODO: Handle start_byte
+    fn read_byte(&mut self, input: &mut InputStream) -> InputResult<u8> {
         match input.read_byte(false) {
             Ok(byte) => {
-                // TODO: self.buffer.push_back(byte);
+                if self.start_byte > 0 && input.processed_len() > self.start_byte {
+                    self.pge.push(byte);
+                }
+                self.buffer.push(byte);
                 Ok(byte)
-            },
-            Err(_) => {
-                // TODO: Handle GRB
-                Err(JpegError::EOF)
             }
+            Err(e) => Err(e),
         }
     }
 }
@@ -192,7 +244,11 @@ pub struct HuffmanTable {
 }
 
 impl HuffmanTable {
-    pub fn new(bits: &[u8], values: &[u8], class: HuffmanTableClass) -> JpegResult<HuffmanTable> {
+    pub fn new(
+        bits: &[u8],
+        values: &[u8],
+        class: HuffmanTableClass,
+    ) -> HuffmanResult<HuffmanTable> {
         assert!(bits.len() == 16);
         let (huffcode, huffsize) = derive_huffman_codes(bits)?;
         // Section F.2.2.3
@@ -256,7 +312,7 @@ impl HuffmanTable {
 }
 
 // Section C.2
-fn derive_huffman_codes(bits: &[u8]) -> JpegResult<(Vec<u16>, Vec<u8>)> {
+fn derive_huffman_codes(bits: &[u8]) -> HuffmanResult<(Vec<u16>, Vec<u8>)> {
     // Figure C.1
     let huffsize = bits.iter()
         .enumerate()
@@ -274,9 +330,7 @@ fn derive_huffman_codes(bits: &[u8]) -> JpegResult<(Vec<u16>, Vec<u8>)> {
             code_size += 1;
         }
         if code >= (1u32 << size) {
-            return Err(JpegError::Malformatted(
-                "bad huffman code length".to_owned(),
-            ));
+            return Err(HuffmanError::BadTable);
         }
         huffcode[i] = code as u16;
         code += 1;

@@ -1,83 +1,10 @@
 use super::error::{JpegError, JpegResult};
 use super::huffman::{HuffmanTable, HuffmanTableClass};
+use super::jpeg::{CodingProcess, Component, Dimensions, EntropyCoding, FrameInfo, ScanInfo};
 use super::marker::Marker;
 use super::marker::Marker::*;
 use byte_converter::BigEndian;
 use iostream::InputStream;
-use std::ops::Range;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Dimensions {
-    pub width: u16,
-    pub height: u16,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum EntropyCoding {
-    Huffman,
-    Arithmetic,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum CodingProcess {
-    DctSequential,
-    DctProgressive,
-    Lossless,
-}
-
-#[derive(Clone)]
-pub struct FrameInfo {
-    pub is_baseline: bool,
-    pub is_differential: bool,
-    pub coding_process: CodingProcess,
-    pub entropy_coding: EntropyCoding,
-    pub precision: u8,
-
-    pub size: Dimensions,
-    pub size_in_mcu: Dimensions,
-    pub components: Vec<Component>,
-}
-
-#[derive(Clone, Debug)]
-pub struct Component {
-    pub identifier: u8,
-
-    pub horizontal_sampling_factor: u8,
-    pub vertical_sampling_factor: u8,
-
-    pub quantization_table_index: usize,
-
-    pub size: Dimensions,
-    pub size_in_block: Dimensions,
-}
-
-#[derive(Debug)]
-pub struct ScanInfo {
-    pub component_indices: Vec<usize>,
-    pub dc_table_indices: Vec<usize>,
-    pub ac_table_indices: Vec<usize>,
-
-    pub spectral_selection: Range<u8>,
-    pub successive_approximation_high: u8,
-    pub successive_approximation_low: u8,
-}
-
-#[derive(Debug)]
-pub enum AppData {
-    Adobe(AdobeColorTransform),
-    Jfif,
-    Avi1,
-}
-
-// http://www.sno.phy.queensu.ca/~phil/exiftool/TagNames/JPEG.html#Adobe
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum AdobeColorTransform {
-    // RGB or CMYK
-    Unknown,
-    YCbCr,
-    // YCbCrK
-    YCCK,
-}
 
 fn read_length(input: &mut InputStream, marker: Marker) -> JpegResult<usize> {
     assert!(marker.has_length());
@@ -518,44 +445,19 @@ pub fn parse_com(input: &mut InputStream) -> JpegResult<Vec<u8>> {
 }
 
 // Section B.2.4.6
-pub fn parse_app(input: &mut InputStream, marker: Marker) -> JpegResult<Option<AppData>> {
+pub fn parse_app(input: &mut InputStream, marker: Marker) -> JpegResult<bool> {
     let length = read_length(input, marker)?;
     let mut bytes_read = 0;
-    let mut result = None;
+    let mut result = false;
     match marker {
         APP(0) => {
             if length >= 5 {
                 let mut buffer = [0u8; 5];
                 input.read(&mut buffer, true, true)?;
                 bytes_read = buffer.len();
-                // http://www.w3.org/Graphics/JPEG/jfif3.pdf
-                if &buffer[0..5] == &[b'J', b'F', b'I', b'F', b'\0'] {
-                    result = Some(AppData::Jfif);
                 // https://sno.phy.queensu.ca/~phil/exiftool/TagNames/JPEG.html#AVI1
-                } else if &buffer[0..5] == &[b'A', b'V', b'I', b'1', b'\0'] {
-                    result = Some(AppData::Avi1);
-                }
-            }
-        }
-        APP(14) => {
-            if length >= 12 {
-                let mut buffer = [0u8; 12];
-                input.read(&mut buffer, true, true)?;
-                bytes_read = buffer.len();
-                // http://www.sno.phy.queensu.ca/~phil/exiftool/TagNames/JPEG.html#Adobe
-                if &buffer[0..6] == &[b'A', b'd', b'o', b'b', b'e', b'\0'] {
-                    let color_transform = match buffer[11] {
-                        0 => AdobeColorTransform::Unknown,
-                        1 => AdobeColorTransform::YCbCr,
-                        2 => AdobeColorTransform::YCCK,
-                        _ => {
-                            return Err(JpegError::Malformatted(
-                                "invalid color transform in adobe app segment".to_owned(),
-                            ))
-                        }
-                    };
-
-                    result = Some(AppData::Adobe(color_transform));
+                if &buffer[0..5] == &[b'A', b'V', b'I', b'1', b'\0'] {
+                    result = true;
                 }
             }
         }

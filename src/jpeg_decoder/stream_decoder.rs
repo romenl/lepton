@@ -1,46 +1,59 @@
 use std::thread;
 
-use super::decoder::JpegDecoder;
+use super::decoder::{DecodeResult, JpegDecoder};
 use super::error::JpegResult;
 use iostream::{iostream, OutputStream};
 
 pub struct JpegStreamDecoder {
-    decoder_handle: Option<thread::JoinHandle<JpegResult<()>>>,
+    decoder_handle: Option<thread::JoinHandle<DecodeResult>>,
     ostream: OutputStream,
+    result: Option<DecodeResult>,
 }
 
 impl JpegStreamDecoder {
-    pub fn new() -> JpegResult<Self> {
+    pub fn new(start_byte: usize) -> JpegResult<Self> {
         let (istream, ostream) = iostream();
         let decoder_handle = thread::Builder::new()
             .name("decoder thread".to_owned())
-            .spawn(move || JpegDecoder::new(istream).decode())?;
+            .spawn(move || JpegDecoder::new(istream, start_byte, false).decode())?;
         Ok(JpegStreamDecoder {
             decoder_handle: Some(decoder_handle),
             ostream,
+            result: None,
         })
     }
 
-    pub fn decode(&mut self, input: &[u8], input_offset: &mut usize) -> JpegResult<()> {
-        match self.ostream.write(&input[*input_offset..]) {
+    pub fn decode(&mut self, input: &[u8]) -> JpegDecodeResult {
+        match self.ostream.write(input) {
             Ok(_) => {
-                *input_offset = input.len();
-                Ok(())
+                JpegDecodeResult::NeedsMoreInput
             }
             Err(_) => self.finish(),
         }
     }
 
-    pub fn flush(&mut self) -> JpegResult<()> {
+    pub fn flush(&mut self) -> JpegDecodeResult {
         let _ = self.ostream.write_eof();
         self.finish()
     }
 
-    fn finish(&mut self) -> JpegResult<()> {
-        // TODO: Handle the case where docoder_handle is already taken
-        match self.decoder_handle.take().unwrap().join().unwrap() {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e),
+    pub fn take_result(self) -> Result<DecodeResult, Self> {
+        if let Some(result) = self.result {
+            Ok(result)
+        } else {
+            Err(self)
         }
     }
+
+    fn finish(&mut self) -> JpegDecodeResult {
+        if self.decoder_handle.is_some() {
+            self.result = Some(self.decoder_handle.take().unwrap().join().unwrap());
+        }
+        JpegDecodeResult::Finish
+    }
+}
+
+pub enum JpegDecodeResult {
+    Finish,
+    NeedsMoreInput,
 }

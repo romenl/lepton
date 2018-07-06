@@ -1,7 +1,8 @@
 mod decoder;
 mod error;
 mod huffman;
-mod idct;
+// mod idct;
+mod jpeg;
 mod marker;
 mod parser;
 mod stream_decoder;
