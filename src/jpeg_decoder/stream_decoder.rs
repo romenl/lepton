@@ -4,6 +4,8 @@ use super::decoder::{DecodeResult, JpegDecoder};
 use super::error::JpegResult;
 use iostream::{iostream, OutputStream};
 
+const PRE_LOAD_LEN: usize = 4 * 1024;
+
 pub struct JpegStreamDecoder {
     decoder_handle: Option<thread::JoinHandle<DecodeResult>>,
     ostream: OutputStream,
@@ -12,7 +14,7 @@ pub struct JpegStreamDecoder {
 
 impl JpegStreamDecoder {
     pub fn new(start_byte: usize) -> JpegResult<Self> {
-        let (istream, ostream) = iostream();
+        let (istream, ostream) = iostream(PRE_LOAD_LEN);
         let decoder_handle = thread::Builder::new()
             .name("decoder thread".to_owned())
             .spawn(move || JpegDecoder::new(istream, start_byte, false).decode())?;
